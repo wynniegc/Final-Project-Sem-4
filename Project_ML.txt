@@ -1,0 +1,127 @@
+import time
+import locale
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+
+import influxdb_client
+from influxdb_client.client.write_api import SYNCHRONOUS
+
+import pyrebase
+
+
+############################## SETUP ##############################
+############### IMPORT DATA FROM PC 
+data = pd.read_csv(r"C:\Users\Wynnie GC\Desktop\Home_Applience_Random_Data.csv")
+df = pd.DataFrame(data)
+
+# Applience labeling
+label_map = {1 : 'Air Conditioner', 2 : 'Blender', 3 : 'Electric Fan', 
+             4 : 'Personal Computer', 5 : 'Electric Kettle', 6 : 'Electric Oven', 
+             7 : 'Electric Stove', 8 : 'Hair Dryer', 9 : 'Iron', 
+             10 : 'Microwave', 11 : 'Refrigerator', 12 : 'Rice Cooker', 
+             13 : 'Television', 14 : 'Toaster', 15 : 'Vacuum Cleaner', 
+             16 : 'Washing Machine', 17 : 'Water Dispenser', 18 : 'Water Heater'}
+
+
+############### FIREBASE 
+config = {
+  "apiKey" : "AIzaSyBeJnp38L3j_zP2dZ2w_ywWiGPo5mKO0yI",
+  "authDomain" : "electricalmanaged.firebaseapp.com",
+  "databaseURL" : "https://electricalmanaged-default-rtdb.asia-southeast1.firebasedatabase.app",
+  "projectId" : "electricalmanaged",
+  "storageBucket" : "electricalmanaged.appspot.com",
+  "messagingSenderId" : "831563499430",
+  "appId" : "1:831563499430:web:23c10dc148eef0288d7167"
+  };
+
+firebase = pyrebase.initialize_app(config)
+storage = firebase.storage()
+db = firebase.database()
+
+
+############### INFLUX DB
+bucket = "wynnie"
+org = "stephenrichard19@gmail.com"      #saya meminjam karena milik saya error (ver 3), yang ini ver 1.
+token = "WffHme3Si91Y5AWDHhapIBOXe5w_Lmr55SbLW40JiJi01Gc6582O3ZS0ZGwTxMN1ljnUFZ4TGQxqWk00SCk9FQ=="
+url="https://ap-southeast-2-1.aws.cloud2.influxdata.com"
+
+client = influxdb_client.InfluxDBClient(url=url,token=token,org=org)
+write_api = client.write_api(write_options=SYNCHRONOUS)
+
+
+############### MACHINE LEARNING 
+# Create a linear regression model
+model = LinearRegression()
+
+# train the model on the voltage, current, and usage data to predict monthly energy consumption and appliance type
+X = df[['Voltage (V)', 'Current (A)',]]
+y_usage = df[ 'Usage (hours/month)']
+y_appliance = df['Appliance']
+model.fit(X, y_usage)
+model_appliance = LinearRegression()
+model_appliance.fit(X, y_appliance)
+
+
+
+############################## LOOP ##############################
+def prediction_loop():
+    counter = 0 
+    while counter < 100:
+        print("Counter:", counter)
+
+        ############### MACHINE LEARNING PROCESS
+        # Retreiving Data From Firebase
+        current_value = db.child("UsersData").child("4YZYCREWqtVhBGA37z8jhVS5Z4g1").child("From Arduino").child("Current").get()
+        voltage_value = db.child("UsersData").child("4YZYCREWqtVhBGA37z8jhVS5Z4g1").child("From Arduino").child("Voltage").get()
+        energy_value = db.child("UsersData").child("4YZYCREWqtVhBGA37z8jhVS5Z4g1").child("From Arduino").child("Energy").get()
+        tariff_value = db.child("UsersData").child("4YZYCREWqtVhBGA37z8jhVS5Z4g1").child("From Android").child("Tariff").get()
+
+        current = current_value.val()
+        voltage = voltage_value.val()
+        energy = energy_value.val()
+        tariff = tariff_value.val()
+        tariff = float(tariff)
+
+        # use the trained model to predict monthly energy consumption, bill, and appliance type for a new appliance
+        new_appliance = {'Voltage (V)': voltage, 'Current (A)': current}
+        new_X = pd.DataFrame([new_appliance])[['Voltage (V)', 'Current (A)',]]
+        predicted_usage = model.predict(new_X)
+
+        predicted_appliance = model_appliance.predict(new_X)
+        predicted_appliance_int = predicted_appliance.astype(int)  # round and convert to integer
+        appliance = label_map.get(predicted_appliance_int[0])
+
+        predicted_energy = predicted_usage*energy
+        predicted_bill = predicted_energy*tariff
+
+
+        ############### SENDING RESULT 
+        # Print data result for terminal
+        print(f"Estimated appliance type: {appliance}" )
+        print(f"Estimated monthly hour usage: {predicted_usage[0]:.2f} hour")
+        print(f"Estimated monthly energy consumption: {predicted_energy[0]:.2f} kWh")
+        print(f"Estimated monthly bill: Rp {predicted_bill[0]:.2f}")
+
+
+        ############### FIREBASE 
+        db.child("UsersData").child("4YZYCREWqtVhBGA37z8jhVS5Z4g1").child("From Python").update({"Predict Appliance": appliance})
+        db.child("UsersData").child("4YZYCREWqtVhBGA37z8jhVS5Z4g1").child("From Python").update({"Predict Bill": round(predicted_bill[0], 2)})
+        db.child("UsersData").child("4YZYCREWqtVhBGA37z8jhVS5Z4g1").child("From Python").update({"Predict Hour": round(predicted_usage[0], 2)})
+        db.child("UsersData").child("4YZYCREWqtVhBGA37z8jhVS5Z4g1").child("From Python").update({"Predict Hour Energy": round(predicted_energy[0], 2)})
+
+
+        ############ INFLUXDB
+        p = influxdb_client.Point("Energy Monitoring").tag("device" , "ESP32").tag("SSID","_Vanilla")
+        p.field("Predict Bill", predicted_bill[0])
+        p.field("Predict Hour", predicted_usage[0])
+        p.field("Predict Hour Energy", predicted_energy[0])
+
+        write_api.write(bucket=bucket, org=org, record=p)
+
+        counter += 1
+        print("Counter updated:", counter)
+        
+        time.sleep(3)
+
+prediction_loop()
+
